@@ -48,7 +48,8 @@ public class NoVanillaLogPlugin extends JavaPlugin {
             "Successfully filled",         // /fill command       ( 5,978 lines)
             "Target is invulnerable",      // /damage command     ( 1,562 lines)
             "Summoned ",                   // /summon command     (   380 lines)
-            "Given ",                      // /give vanilla       (     0 — pre-configured)
+            "Given ",                      // /give vanilla (< 1.21)
+            "Gave ",                       // /give vanilla (1.21+)
             "Teleported "                  // /tp command         (     2 — pre-configured)
     );
 

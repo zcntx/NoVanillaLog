@@ -13,7 +13,8 @@ filtered-patterns:
   - "Successfully filled"         # /fill command
   - "Target is invulnerable"      # /damage command
   - "Summoned "                   # /summon command
-  - "Given "                      # /give vanilla (pre-configured)
+  - "Given "                      # /give vanilla (< 1.21)
+  - "Gave "                       # /give vanilla (1.21+)
   - "Teleported "                 # /tp command
 
 # Set to false if you want matching messages to still appear in OPs' chat

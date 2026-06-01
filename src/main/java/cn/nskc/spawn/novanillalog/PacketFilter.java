@@ -8,8 +8,9 @@ import org.bukkit.NamespacedKey;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Level;
@@ -88,7 +89,23 @@ public class PacketFilter {
             return;
         }
         try {
-            addListenerHandle.invoke(key, (ChannelInitializeListener) this::initializeChannel);
+            // Create a dynamic proxy that implements the REAL
+            // io.papermc.paper.network.ChannelInitializeListener interface
+            // at runtime.  A lambda / functional-interface cast won't work
+            // because the JVM sees our private interface as a different type.
+            Class<?> listenerClass = Class.forName(
+                    "io.papermc.paper.network.ChannelInitializeListener");
+            Object listener = Proxy.newProxyInstance(
+                    listenerClass.getClassLoader(),
+                    new Class<?>[]{listenerClass},
+                    (proxy, method, args) -> {
+                        if (method.getName().equals("initializeChannel") && args.length == 1) {
+                            installHandler((Channel) args[0]);
+                            return null;
+                        }
+                        return null;
+                    });
+            addListenerHandle.invoke(key, listener);
             logger.info("PacketFilter registered for in-game suppression.");
         } catch (Throwable e) {
             logger.log(Level.WARNING, "PacketFilter: failed to register listener", e);
@@ -103,14 +120,7 @@ public class PacketFilter {
         }
     }
 
-    // ── ChannelInitializeListener (functional interface mirror) ────────────
-
-    @FunctionalInterface
-    private interface ChannelInitializeListener {
-        void initializeChannel(Channel channel);
-    }
-
-    private void initializeChannel(Channel channel) {
+    private void installHandler(Channel channel) {
         channel.pipeline().addBefore("packet_handler", "novanillalog_packet_filter", handler);
     }
 

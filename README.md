@@ -58,7 +58,8 @@ filtered-patterns:
   - "Successfully filled"         # /fill
   - "Target is invulnerable"      # /damage
   - "Summoned "                   # /summon
-  - "Given "                      # /give
+  - "Given "                      # /give (< 1.21)
+  - "Gave "                       # /give (1.21+)
   - "Teleported "                 # /tp
 
 # false = 管理员左下角仍然显示指令反馈
@@ -135,7 +136,9 @@ Folia 兼容：
 
 ## 无外部依赖
 
-插件仅使用 Paper API + 服务端自带的 Log4j / Netty。无需安装 ProtocolLib 或任何前置插件。游戏内拦截通过反射调用 Paper 的 `ChannelInitializeListenerHolder`，编译时不需要内部 API jar，运行时自动解析。
+插件仅使用 Paper API + 服务端自带的 Log4j / Netty。无需安装 ProtocolLib。游戏内拦截通过 `java.lang.reflect.Proxy` 动态代理注册到 Paper 的 `ChannelInitializeListenerHolder`，编译时零内部 API 依赖。
+
+> **注意**：游戏内屏蔽在首次安装或升级 jar 后需要**重启服务器**才能生效（需要重新注册 Netty pipeline handler）。`/novanillalog reload` 只更新匹配关键词，不重注册网络层钩子。
 
 ## 为什么 rm 日志文件后不会新建
 

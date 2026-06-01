@@ -1,0 +1,20 @@
+name: NoVanillaLog
+version: "1.1.0"
+main: cn.nskc.spawn.novanillalog.NoVanillaLogPlugin
+api-version: "1.21"
+folia-supported: true
+description: Suppress vanilla command spam + archive high-risk commands to standalone audit log
+author: NSKC
+website: https://github.com/nskc-spawn/NoVanillaLog
+
+commands:
+  novanillalog:
+    description: Reload NoVanillaLog filter patterns
+    usage: /novanillalog reload
+    permission: novanillalog.reload
+    aliases: [nvl]
+
+permissions:
+  novanillalog.reload:
+    description: Allows reloading NoVanillaLog filter patterns
+    default: op

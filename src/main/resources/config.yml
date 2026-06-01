@@ -1,0 +1,49 @@
+# ── NoVanillaLog Configuration ───────────────────────────────────────────
+# Edit this file and run /novanillalog reload to apply changes.
+# No server restart needed.
+
+# ── Console + in-game spam suppression ──────────────────────────────────
+# Messages matching ANY of these patterns are:
+#   • removed from the server console + log file
+#   • blocked from appearing in OPs' in-game chat (when suppress-in-game is true)
+filtered-patterns:
+  - "Displaying particle"         # /particle command
+  - "Changed the block"           # /setblock command
+  - "Applied effect"              # /effect command
+  - "Successfully filled"         # /fill command
+  - "Target is invulnerable"      # /damage command
+  - "Summoned "                   # /summon command
+  - "Given "                      # /give vanilla (pre-configured)
+  - "Teleported "                 # /tp command
+
+# Set to false if you want matching messages to still appear in OPs' chat
+suppress-in-game: true
+
+# ── Audit archive ───────────────────────────────────────────────────────
+# Messages matching ANY of these patterns are ALSO written to a separate
+# audit file (plugins/NoVanillaLog/audit/audit.log).  They still appear
+# in the main console log unless also listed in filtered-patterns above.
+audit:
+  enabled: true
+  max-file-size-mb: 10      # Rotate when audit.log exceeds this size
+
+  patterns:
+    # /give — item grants
+    - "issued server command: /give"
+    - "issued server command: /minecraft:give"
+
+    # Economy — money / points
+    - "issued server command: /money give"
+    - "issued server command: /playercurrency"
+    - "issued server command: /gmp money"
+    - "issued server command: /ply give"
+
+    # High-risk administration
+    - "issued server command: /op "
+    - "issued server command: /deop "
+    - "issued server command: /ban "
+    - "issued server command: /ban-ip "
+    - "issued server command: /kick "
+    - "issued server command: /pardon "
+    - "issued server command: /whitelist "
+    - "issued server command: /gamemode "

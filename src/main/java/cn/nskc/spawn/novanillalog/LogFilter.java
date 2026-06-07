@@ -39,7 +39,7 @@ public class LogFilter extends AbstractFilter {
         }
 
         for (String pattern : patterns) {
-            if (!pattern.isEmpty() && formatted.contains(pattern)) {
+            if (!pattern.isEmpty() && containsIgnoreCase(formatted, pattern)) {
                 return Result.DENY;
             }
         }
@@ -57,7 +57,7 @@ public class LogFilter extends AbstractFilter {
             return Result.NEUTRAL;
         }
         for (String pattern : patterns) {
-            if (!pattern.isEmpty() && formatted.contains(pattern)) {
+            if (!pattern.isEmpty() && containsIgnoreCase(formatted, pattern)) {
                 return Result.DENY;
             }
         }
@@ -70,7 +70,7 @@ public class LogFilter extends AbstractFilter {
             return Result.NEUTRAL;
         }
         for (String pattern : patterns) {
-            if (!pattern.isEmpty() && msg.contains(pattern)) {
+            if (!pattern.isEmpty() && containsIgnoreCase(msg, pattern)) {
                 return Result.DENY;
             }
         }
@@ -84,11 +84,15 @@ public class LogFilter extends AbstractFilter {
         }
         String s = msg.toString();
         for (String pattern : patterns) {
-            if (!pattern.isEmpty() && s.contains(pattern)) {
+            if (!pattern.isEmpty() && containsIgnoreCase(s, pattern)) {
                 return Result.DENY;
             }
         }
         return Result.NEUTRAL;
+    }
+
+    private static boolean containsIgnoreCase(String text, String pattern) {
+        return text.toLowerCase().contains(pattern.toLowerCase());
     }
 
     /**

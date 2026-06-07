@@ -1,9 +1,9 @@
 name: NoVanillaLog
-version: "1.1.0"
+version: "1.2.8"
 main: cn.nskc.spawn.novanillalog.NoVanillaLogPlugin
 api-version: "1.21"
 folia-supported: true
-description: Suppress vanilla command spam + archive high-risk commands to standalone audit log
+description: Suppress vanilla command spam from console and in-game chat
 author: NSKC
 website: https://github.com/nskc-spawn/NoVanillaLog
 

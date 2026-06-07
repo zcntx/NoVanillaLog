@@ -4,15 +4,19 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.Appender;
 import org.apache.logging.log4j.core.Logger;
 import org.apache.logging.log4j.core.filter.AbstractFilterable;
+import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
-import org.bukkit.NamespacedKey;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.HandlerList;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
-import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -22,59 +26,30 @@ public class NoVanillaLogPlugin extends JavaPlugin {
     private Logger rootLogger;
 
     // ── Spam filter ────────────────────────────────────────────────────────
-    // Attached to CONSOLE / FILE appenders so it only suppresses output
-    // there — the AuditAppender (which has its own filter) still receives
-    // every event and decides independently.
     private LogFilter spamFilter;
 
-    // ── Audit archive ──────────────────────────────────────────────────────
-    private AuditFilter   auditFilter;
-    private AuditAppender auditAppender;
-
-    // ── In-game packet filter ──────────────────────────────────────────────
-    private PacketFilter  packetFilter;
-    private boolean       suppressInGame;
-
-    private static final NamespacedKey PACKET_FILTER_KEY =
-            new NamespacedKey("novanillalog", "packet_filter");
+    // ── In-game system chat filter ─────────────────────────────────────────
+    private SystemChatFilter systemChatFilter;
+    private PacketFilter     packetFilter;
+    private Listener         joinListener;
+    private boolean          suppressInGame;
 
     // ── Config defaults ────────────────────────────────────────────────────
 
     /** Suppress these from the console / main log file AND in-game chat. */
     private static final List<String> DEFAULT_SPAM_PATTERNS = List.of(
-            "Displaying particle",         // /particle command   (48,097 lines in luminol.old.log)
-            "Changed the block",           // /setblock command   (19,564 lines)
-            "Applied effect",              // /effect command     (12,573 lines)
-            "Successfully filled",         // /fill command       ( 5,978 lines)
-            "Target is invulnerable",      // /damage command     ( 1,562 lines)
-            "Summoned ",                   // /summon command     (   380 lines)
-            "Given ",                      // /give vanilla (< 1.21)
-            "Gave ",                       // /give vanilla (1.21+)
-            "Teleported "                  // /tp command         (     2 — pre-configured)
+            // English text (AdventureComponent packets)
+            "已将",              // /effect (中文)
+            "effect",            // /effect (英文)
+            "Applied",           // /effect, /damage (英文)
+            "Summoned",          // /summon (英文)
+            "particle",          // /particle
+            // Translation keys (NMS MutableComponent packets)
+            "commands.effect",
+            "commands.summon",
+            "commands.damage",
+            "commands.particle"
     );
-
-    /** Archive these to the standalone audit file. */
-    private static final List<String> DEFAULT_AUDIT_PATTERNS = List.of(
-            // /give
-            "issued server command: /give",
-            "issued server command: /minecraft:give",
-            // Economy — /money / playercurrency / gmp / ply
-            "issued server command: /money give",
-            "issued server command: /playercurrency",
-            "issued server command: /gmp money",
-            "issued server command: /ply give",
-            // High-risk administration
-            "issued server command: /op ",
-            "issued server command: /deop ",
-            "issued server command: /ban ",
-            "issued server command: /ban-ip ",
-            "issued server command: /kick ",
-            "issued server command: /pardon ",
-            "issued server command: /whitelist ",
-            "issued server command: /gamemode "
-    );
-
-    private static final long DEFAULT_MAX_AUDIT_MB = 10;
 
     // ── Plugin lifecycle ───────────────────────────────────────────────────
 
@@ -83,17 +58,10 @@ public class NoVanillaLogPlugin extends JavaPlugin {
         saveDefaultConfig();
         loadConfig();
 
-        String auditPath = auditAppender != null
-                ? auditAppender.getLogFile().toString()
-                : "(disabled)";
-
         getLogger().info("NoVanillaLog enabled — suppressing "
                 + (spamFilter != null ? spamFilter.getPatterns().size() : 0)
                 + " spam pattern(s) from console"
-                + (suppressInGame ? " + in-game" : "")
-                + ", archiving "
-                + (auditFilter != null ? auditFilter.getPatterns().size() : 0)
-                + " audit pattern(s) → " + auditPath);
+                + (suppressInGame ? " + in-game" : ""));
     }
 
     @Override
@@ -112,9 +80,6 @@ public class NoVanillaLogPlugin extends JavaPlugin {
         // ── defaults ───────────────────────────────────────────────────
         cfg.addDefault("filtered-patterns", DEFAULT_SPAM_PATTERNS);
         cfg.addDefault("suppress-in-game", true);
-        cfg.addDefault("audit.enabled", true);
-        cfg.addDefault("audit.max-file-size-mb", (int) DEFAULT_MAX_AUDIT_MB);
-        cfg.addDefault("audit.patterns", DEFAULT_AUDIT_PATTERNS);
         cfg.options().copyDefaults(true);
         saveConfig();
 
@@ -123,40 +88,33 @@ public class NoVanillaLogPlugin extends JavaPlugin {
 
         rootLogger = (Logger) LogManager.getRootLogger();
 
-        // ── Spam filter → attach to all EXISTING appenders EXCEPT AuditAppender
+        // ── Spam filter → attach to all EXISTING appenders
         List<String> spam = cfg.getStringList("filtered-patterns");
         if (spam == null || spam.isEmpty()) spam = DEFAULT_SPAM_PATTERNS;
         spamFilter = new LogFilter(spam);
 
         for (Appender app : rootLogger.getAppenders().values()) {
-            if (app instanceof AbstractFilterable filterable && !(app instanceof AuditAppender)) {
+            if (app instanceof AbstractFilterable filterable) {
                 filterable.addFilter(spamFilter);
             }
         }
 
-        // ── In-game packet filter ──────────────────────────────────────
+        // ── In-game system chat filter ──────────────────────────────────
         suppressInGame = cfg.getBoolean("suppress-in-game", true);
         if (suppressInGame && !spam.isEmpty()) {
-            packetFilter = new PacketFilter(spam, getLogger());
-            packetFilter.register(PACKET_FILTER_KEY);
-        }
+            // Packet-level interception via Paper's ChannelInitializeListenerHolder
+            packetFilter = new PacketFilter(this, spam);
+            packetFilter.register();
+            getLogger().info("Packet-level filter registered for system messages.");
 
-        // ── Audit archive ──────────────────────────────────────────────
-        boolean auditEnabled = cfg.getBoolean("audit.enabled", true);
-        List<String> auditPatterns = cfg.getStringList("audit.patterns");
-        if (auditPatterns == null || auditPatterns.isEmpty()) {
-            auditPatterns = DEFAULT_AUDIT_PATTERNS;
-        }
-
-        if (auditEnabled && !auditPatterns.isEmpty()) {
-            long maxMb = cfg.getLong("audit.max-file-size-mb", DEFAULT_MAX_AUDIT_MB);
-            long maxBytes = Math.max(maxMb, 1) * 1024 * 1024;
-
-            Path auditDir = getDataFolder().toPath().resolve("audit");
-            auditFilter = new AuditFilter(auditPatterns);
-            auditAppender = new AuditAppender("NoVanillaLog-Audit", auditFilter, auditDir, maxBytes);
-            auditAppender.start();
-            rootLogger.addAppender(auditAppender);
+            // Inject handler for players who join after plugin load
+            joinListener = new Listener() {
+                @EventHandler(priority = EventPriority.LOWEST)
+                public void onJoin(PlayerJoinEvent event) {
+                    packetFilter.injectPlayer(event.getPlayer());
+                }
+            };
+            Bukkit.getPluginManager().registerEvents(joinListener, this);
         }
     }
 
@@ -171,20 +129,24 @@ public class NoVanillaLogPlugin extends JavaPlugin {
             spamFilter = null;
         }
 
-        // Remove packet filter
+        // Remove join listener
+        if (joinListener != null) {
+            HandlerList.unregisterAll(joinListener);
+            joinListener = null;
+        }
+
+        // Remove packet filter (Netty channel handler)
         if (packetFilter != null) {
-            packetFilter.unregister(PACKET_FILTER_KEY);
+            packetFilter.unregister();
             packetFilter = null;
         }
-        suppressInGame = false;
 
-        // Stop and remove audit appender
-        if (rootLogger != null && auditAppender != null) {
-            auditAppender.stop();
-            rootLogger.removeAppender(auditAppender);
-            auditAppender = null;
-            auditFilter = null;
+        // Remove system chat filter
+        if (systemChatFilter != null) {
+            HandlerList.unregisterAll(systemChatFilter);
+            systemChatFilter = null;
         }
+        suppressInGame = false;
 
         rootLogger = null;
     }
@@ -202,12 +164,7 @@ public class NoVanillaLogPlugin extends JavaPlugin {
             return true;
         }
 
-        if (args.length == 0) {
-            showStatus(sender);
-            return true;
-        }
-
-        if (args[0].equalsIgnoreCase("reload")) {
+        if (args.length == 0 || args[0].equalsIgnoreCase("reload")) {
             reloadCommand(sender);
             return true;
         }
@@ -217,46 +174,14 @@ public class NoVanillaLogPlugin extends JavaPlugin {
         return true;
     }
 
-    // ── Status display ─────────────────────────────────────────────────────
-
-    private void showStatus(CommandSender sender) {
-        sender.sendMessage(ChatColor.GOLD + "NoVanillaLog v" + getDescription().getVersion());
-
-        List<String> spam = spamFilter != null ? spamFilter.getPatterns() : Collections.emptyList();
-        sender.sendMessage("");
-        sender.sendMessage(ChatColor.RED + "Suppressed from console" +
-                (suppressInGame ? " + in-game" : "") + " (" + spam.size() + "):");
-        for (String p : spam) {
-            sender.sendMessage(ChatColor.GRAY + "  ✕ " + ChatColor.WHITE + "\"" + p + "\"");
-        }
-
-        List<String> audit = auditFilter != null ? auditFilter.getPatterns() : Collections.emptyList();
-        String auditFile = auditAppender != null
-                ? auditAppender.getLogFile().toAbsolutePath().toString()
-                : ChatColor.RED + "(disabled)";
-        sender.sendMessage("");
-        sender.sendMessage(ChatColor.GREEN + "Archived to audit log (" + audit.size() + "):");
-        for (String p : audit) {
-            sender.sendMessage(ChatColor.GRAY + "  → " + ChatColor.WHITE + "\"" + p + "\"");
-        }
-        sender.sendMessage(ChatColor.GRAY + "  Audit file: " + ChatColor.WHITE + auditFile);
-
-        sender.sendMessage("");
-        sender.sendMessage(ChatColor.GRAY + "Edit " + ChatColor.YELLOW + "config.yml"
-                + ChatColor.GRAY + " and run " + ChatColor.YELLOW + "/novanillalog reload"
-                + ChatColor.GRAY + " to apply changes.");
-    }
-
     // ── Reload ─────────────────────────────────────────────────────────────
 
     private void reloadCommand(CommandSender sender) {
-        List<String> oldSpam  = spamFilter  != null ? spamFilter.getPatterns()  : Collections.emptyList();
-        List<String> oldAudit = auditFilter != null ? auditFilter.getPatterns() : Collections.emptyList();
+        List<String> oldSpam = spamFilter != null ? spamFilter.getPatterns() : Collections.emptyList();
 
         loadConfig();
 
-        List<String> newSpam  = spamFilter  != null ? spamFilter.getPatterns()  : Collections.emptyList();
-        List<String> newAudit = auditFilter != null ? auditFilter.getPatterns() : Collections.emptyList();
+        List<String> newSpam = spamFilter != null ? spamFilter.getPatterns() : Collections.emptyList();
 
         sender.sendMessage(ChatColor.GREEN + "NoVanillaLog reloaded!");
 
@@ -273,30 +198,9 @@ public class NoVanillaLogPlugin extends JavaPlugin {
                     sender.sendMessage(ChatColor.RED + "  - " + ChatColor.WHITE + "\"" + p + "\"");
                 }
             }
-        }
-
-        if (!newAudit.equals(oldAudit)) {
-            sender.sendMessage("");
-            sender.sendMessage(ChatColor.GREEN + "Archived to audit log (" + newAudit.size() + "):");
-            for (String p : newAudit) {
-                String prefix = oldAudit.contains(p) ? ChatColor.GRAY + "  → " : ChatColor.GREEN + "  + ";
-                sender.sendMessage(prefix + ChatColor.WHITE + "\"" + p + "\"");
-            }
-            for (String p : oldAudit) {
-                if (!newAudit.contains(p)) {
-                    sender.sendMessage(ChatColor.RED + "  - " + ChatColor.WHITE + "\"" + p + "\"");
-                }
-            }
-        }
-
-        if (newSpam.equals(oldSpam) && newAudit.equals(oldAudit)) {
+        } else {
             sender.sendMessage(ChatColor.GRAY + "(no changes detected)");
         }
-
-        String auditPath = auditAppender != null
-                ? auditAppender.getLogFile().toAbsolutePath().toString()
-                : ChatColor.RED + "(disabled)";
-        sender.sendMessage(ChatColor.GRAY + "Audit file: " + ChatColor.WHITE + auditPath);
     }
 
     // ── Tab complete ───────────────────────────────────────────────────────

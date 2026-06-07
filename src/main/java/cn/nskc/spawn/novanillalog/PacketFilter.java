@@ -1,182 +1,274 @@
 package cn.nskc.spawn.novanillalog;
 
 import io.netty.channel.Channel;
-import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
-import org.bukkit.NamespacedKey;
+import org.bukkit.Bukkit;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
 
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
-import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
- * Installs a Netty outbound handler on every player channel to drop
- * {@code ClientboundSystemChatPacket}s whose text matches spam patterns.
+ * Netty-based packet filter that intercepts outgoing
+ * {@code ClientboundSystemChatPacket} to suppress server→client system
+ * messages (e.g. "Applied effect Resistance to …") that bypass
+ * {@code AsyncChatEvent}.
  *
- * All Paper / Minecraft internal API access is done via reflection +
- * {@code MethodHandle} so the plugin compiles against the public Paper API
- * alone.  At runtime (on a real Paper server) the internal classes are
- * present and the calls resolve normally.
+ * <p>Uses Paper's {@code ChannelInitializeListenerHolder} (via reflection)
+ * for new connections and direct Netty channel injection for
+ * already-connected players.  No ProtocolLib or NMS compile dependency
+ * required.</p>
  */
 public class PacketFilter {
 
+    private static final String HANDLER_NAME = "novanillalog_chat_filter";
     private static final String PACKET_CLASS =
             "net.minecraft.network.protocol.game.ClientboundSystemChatPacket";
-    private static final String LISTENER_HOLDER_CLASS =
-            "io.papermc.paper.network.ChannelInitializeListenerHolder";
 
+    private final Plugin plugin;
     private final List<String> patterns;
-    private final ChannelDuplexHandler handler;
-    private final Logger logger;
+    private Object listenerKey; // net.kyori.adventure.key.Key
 
-    // ── Reflective handles (resolved once at construction) ─────────────────
-
-    private final MethodHandle addListenerHandle;
-    private final MethodHandle removeListenerHandle;
-    private final MethodHandle componentContent;   // ClientboundSystemChatPacket.content()
-    private final MethodHandle componentGetString; // Component.getString()
-
-    public PacketFilter(List<String> patterns, Logger logger) {
+    public PacketFilter(Plugin plugin, List<String> patterns) {
+        this.plugin = plugin;
         this.patterns = new ArrayList<>(patterns);
-        this.logger = logger;
-        this.handler = createHandler();
-
-        MethodHandles.Lookup lookup = MethodHandles.lookup();
-        addListenerHandle     = resolveListenerMethod(lookup, "addListener");
-        removeListenerHandle  = resolveListenerMethod(lookup, "removeListener");
-        componentContent      = resolvePacketMethod(lookup);
-        componentGetString    = resolveComponentMethod(lookup);
     }
 
-    // ── Netty handler ──────────────────────────────────────────────────────
-
-    private ChannelDuplexHandler createHandler() {
-        return new ChannelDuplexHandler() {
-            @Override
-            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-                if (componentContent != null && componentGetString != null) {
-                    if (msg.getClass().getName().equals(PACKET_CLASS)) {
-                        try {
-                            Object component = componentContent.invoke(msg);
-                            if (component != null) {
-                                String text = (String) componentGetString.invoke(component);
-                                if (matches(text)) {
-                                    return; // drop the packet
-                                }
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                }
-                super.write(ctx, msg, promise);
-            }
-        };
-    }
-
-    // ── Register / unregister with Paper ───────────────────────────────────
-
-    public void register(NamespacedKey key) {
-        if (addListenerHandle == null) {
-            logger.warning("PacketFilter: ChannelInitializeListenerHolder not available "
-                    + "— in-game suppression disabled.");
-            return;
-        }
+    /**
+     * Register the Netty channel listener and inject into existing players.
+     */
+    public void register() {
         try {
-            // Create a dynamic proxy that implements the REAL
-            // io.papermc.paper.network.ChannelInitializeListener interface
-            // at runtime.  A lambda / functional-interface cast won't work
-            // because the JVM sees our private interface as a different type.
-            Class<?> listenerClass = Class.forName(
-                    "io.papermc.paper.network.ChannelInitializeListener");
-            Object listener = Proxy.newProxyInstance(
-                    listenerClass.getClassLoader(),
+            // Key.key("novanillalog", "chat_filter")
+            Class<?> keyClass = Class.forName("net.kyori.adventure.key.Key");
+            Method keyMethod = keyClass.getMethod("key", String.class, String.class);
+            listenerKey = keyMethod.invoke(null, "novanillalog", "chat_filter");
+
+            // ChannelInitializeListenerHolder.addListener(key, channel -> injectHandler(channel))
+            Class<?> holderClass = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+            Class<?> listenerClass = Class.forName("io.papermc.paper.network.ChannelInitializeListener");
+
+            // Create a proxy listener
+            Object listener = java.lang.reflect.Proxy.newProxyInstance(
+                    plugin.getClass().getClassLoader(),
                     new Class<?>[]{listenerClass},
                     (proxy, method, args) -> {
-                        if (method.getName().equals("initializeChannel") && args.length == 1) {
-                            installHandler((Channel) args[0]);
-                            return null;
+                        if ("afterInitChannel".equals(method.getName())) {
+                            injectHandler((Channel) args[0]);
                         }
                         return null;
+                    }
+            );
+
+            Method addListener = holderClass.getMethod("addListener", keyClass, listenerClass);
+            addListener.invoke(null, listenerKey, listener);
+
+            plugin.getLogger().info("Channel listener registered for new connections.");
+
+            // Inject into already-connected players
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                injectPlayer(player);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().severe("Failed to register channel listener: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Unregister the Netty channel listener and remove handlers from all players.
+     */
+    public void unregister() {
+        // Remove handler from all online players' channels
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            try {
+                Channel channel = getChannel(player);
+                if (channel != null) {
+                    channel.eventLoop().execute(() -> {
+                        if (channel.pipeline().get(HANDLER_NAME) != null) {
+                            channel.pipeline().remove(HANDLER_NAME);
+                        }
                     });
-            addListenerHandle.invoke(key, listener);
-            logger.info("PacketFilter registered for in-game suppression.");
-        } catch (Throwable e) {
-            logger.log(Level.WARNING, "PacketFilter: failed to register listener", e);
-        }
-    }
-
-    public void unregister(NamespacedKey key) {
-        if (removeListenerHandle == null) return;
-        try {
-            removeListenerHandle.invoke(key);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void installHandler(Channel channel) {
-        channel.pipeline().addBefore("packet_handler", "novanillalog_packet_filter", handler);
-    }
-
-    // ── Pattern matching ───────────────────────────────────────────────────
-
-    private boolean matches(String text) {
-        if (text == null || text.isEmpty() || patterns.isEmpty()) return false;
-        for (String p : patterns) {
-            if (!p.isEmpty() && text.contains(p)) {
-                return true;
+                }
+            } catch (Exception ignored) {
             }
         }
-        return false;
+
+        // Remove the channel initializer listener
+        try {
+            if (listenerKey != null) {
+                Class<?> holderClass = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+                Class<?> keyClass = Class.forName("net.kyori.adventure.key.Key");
+                Method removeListener = holderClass.getMethod("removeListener", keyClass);
+                removeListener.invoke(null, listenerKey);
+                listenerKey = null;
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to unregister channel listener: " + e.getMessage());
+        }
     }
 
-    // ── Runtime updates ────────────────────────────────────────────────────
+    /**
+     * Inject the handler into an existing player's channel.
+     */
+    public void injectPlayer(Player player) {
+        try {
+            Channel channel = getChannel(player);
+            if (channel != null) {
+                channel.eventLoop().execute(() -> {
+                    if (channel.pipeline().get(HANDLER_NAME) == null) {
+                        injectHandler(channel);
+                    }
+                });
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to inject handler for " + player.getName() + ": " + e.getMessage());
+        }
+    }
 
+    /**
+     * Add the outbound handler to the channel pipeline.
+     */
+    private void injectHandler(Channel channel) {
+        try {
+            if (channel.pipeline().get(HANDLER_NAME) == null) {
+                channel.pipeline().addBefore("packet_handler", HANDLER_NAME,
+                        new ChatFilterHandler());
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("Failed to add handler to channel: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Get the Netty channel from a player via NMS reflection.
+     */
+    private Channel getChannel(Player player) throws Exception {
+        // CraftPlayer.getHandle() -> ServerPlayer
+        Object craftPlayer = Class.forName("org.bukkit.craftbukkit.entity.CraftPlayer").cast(player);
+        Object serverPlayer = craftPlayer.getClass().getMethod("getHandle").invoke(craftPlayer);
+
+        // ServerPlayer.connection -> ServerGamePacketListenerImpl
+        Field connectionField = findField(serverPlayer.getClass(), "connection");
+        Object packetListener = connectionField.get(serverPlayer);
+
+        // ServerGamePacketListenerImpl.connection -> NMS Connection
+        Field nmsConnectionField = findField(packetListener.getClass(), "connection");
+        Object nmsConnection = nmsConnectionField.get(packetListener);
+
+        // NMS Connection.channel -> Netty Channel
+        Field channelField = findField(nmsConnection.getClass(), "channel");
+        return (Channel) channelField.get(nmsConnection);
+    }
+
+    /**
+     * Find a field by name, searching up the class hierarchy.
+     */
+    private Field findField(Class<?> clazz, String name) throws NoSuchFieldException {
+        Class<?> current = clazz;
+        while (current != null) {
+            try {
+                Field field = current.getDeclaredField(name);
+                field.setAccessible(true);
+                return field;
+            } catch (NoSuchFieldException e) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException("Field '" + name + "' not found in " + clazz.getName());
+    }
+
+    /**
+     * Replace the filter patterns at runtime (for /novanillalog reload).
+     */
     public void updatePatterns(List<String> newPatterns) {
         patterns.clear();
         patterns.addAll(newPatterns);
     }
 
-    // ── Reflective method resolution ───────────────────────────────────────
+    /**
+     * Return a defensive copy of current patterns.
+     */
+    public List<String> getPatterns() {
+        return new ArrayList<>(patterns);
+    }
 
-    private static MethodHandle resolveListenerMethod(MethodHandles.Lookup lookup, String name) {
-        try {
-            Class<?> holder = Class.forName(LISTENER_HOLDER_CLASS);
-            // void addListener(NamespacedKey, ChannelInitializeListener)
-            // void removeListener(NamespacedKey)
-            for (Method m : holder.getDeclaredMethods()) {
-                if (m.getName().equals(name) && m.getParameterCount() >= 1) {
-                    return lookup.unreflect(m);
+    /**
+     * Netty outbound handler that inspects and optionally cancels
+     * {@code ClientboundSystemChatPacket} messages.
+     */
+    private class ChatFilterHandler extends ChannelOutboundHandlerAdapter {
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+            if (msg != null && msg.getClass().getName().equals(PACKET_CLASS)) {
+                String text = extractText(msg);
+                if (text != null && matchesPattern(text)) {
+                    promise.setSuccess();
+                    return;
                 }
             }
-        } catch (Throwable ignored) {
+            super.write(ctx, msg, promise);
         }
-        return null;
-    }
 
-    private static MethodHandle resolvePacketMethod(MethodHandles.Lookup lookup) {
-        try {
-            Class<?> packet = Class.forName(PACKET_CLASS);
-            Method m = packet.getDeclaredMethod("content");
-            return lookup.unreflect(m);
-        } catch (Throwable ignored) {
-        }
-        return null;
-    }
+        /**
+         * Extract the text content from the packet's Component field.
+         * Tries Adventure Component serialization first, then falls back
+         * to toString() which contains translation keys for NMS Components.
+         */
+        private String extractText(Object packet) {
+            try {
+                Field[] fields = packet.getClass().getDeclaredFields();
+                if (fields.length == 0) return null;
 
-    private static MethodHandle resolveComponentMethod(MethodHandles.Lookup lookup) {
-        try {
-            Class<?> component = Class.forName("net.minecraft.network.chat.Component");
-            Method m = component.getDeclaredMethod("getString");
-            return lookup.unreflect(m);
-        } catch (Throwable ignored) {
+                fields[0].setAccessible(true);
+                Object component = fields[0].get(packet);
+                if (component == null) return null;
+
+                // Case 1: Adventure Component wrapper (Paper)
+                //   AdventureComponent implements Adventure's Component interface
+                //   Use PlainTextComponentSerializer to get the rendered text
+                try {
+                    Class<?> advCompClass = Class.forName("net.kyori.adventure.text.Component");
+                    if (advCompClass.isInstance(component)) {
+                        Object advComponent = advCompClass.cast(component);
+                        Class<?> plainSerializer = Class.forName(
+                                "net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer");
+                        Object serializer = plainSerializer.getMethod("plainText").invoke(null);
+                        String text = (String) plainSerializer.getMethod("serialize", advCompClass)
+                                .invoke(serializer, advComponent);
+                        return text;
+                    }
+                } catch (Exception ignored) {
+                }
+
+                // Case 2: NMS Component (MutableComponent)
+                //   toString() contains translation keys like
+                //   translation{key='commands.damage.success', ...}
+                //   Use this for matching — translation keys are language-independent
+                return component.toString();
+
+            } catch (Exception e) {
+                return null;
+            }
         }
-        return null;
+
+        /**
+         * Check if the text matches any configured pattern (case-insensitive).
+         */
+        private boolean matchesPattern(String text) {
+            String lower = text.toLowerCase();
+            for (String pattern : patterns) {
+                if (!pattern.isEmpty() && lower.contains(pattern.toLowerCase())) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 }
